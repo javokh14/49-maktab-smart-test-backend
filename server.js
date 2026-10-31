@@ -9,74 +9,287 @@ import { createClient } from '@libsql/client';
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
-const db = createClient({ url: process.env.TURSO_DATABASE_URL || 'file:local-dev.db', authToken: process.env.TURSO_AUTH_TOKEN || undefined });
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:local-dev.db',
+  authToken: process.env.TURSO_AUTH_TOKEN || undefined,
+});
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-change-me';
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(x=>x.trim()).filter(Boolean);
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
 const sseClients = new Set();
 
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '1mb' }));
-app.use(cors({ origin(origin, cb){ if(!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin) || process.env.NODE_ENV!=='production') return cb(null,true); cb(new Error('CORS_BLOCKED')); } }));
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') return cb(null, true);
+    cb(new Error('CORS_BLOCKED'));
+  },
+}));
 
-const clean=(v,n=200)=>String(v??'').trim().slice(0,n);
-const code=(v)=>clean(v,24).toUpperCase().replace(/\s+/g,'');
-const one=async(sql,args=[])=>{ const r=await db.execute({sql,args}); return r.rows[0]||null; };
-const all=async(sql,args=[])=>{ const r=await db.execute({sql,args}); return r.rows; };
-const run=(sql,args=[])=>db.execute({sql,args});
-const randomCode=()=>crypto.randomBytes(3).toString('hex').toUpperCase();
-const grade=p=>p>=86?5:p>=71?4:p>=55?3:2;
-const broadcast=(type,payload={})=>{ const msg=`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`; for(const res of sseClients){ try{res.write(msg)}catch{ sseClients.delete(res); } } };
+const clean = (v, n = 200) => String(v ?? '').trim().slice(0, n);
+const cleanCode = v => clean(v, 24).toUpperCase().replace(/\s+/g, '');
+const one = async (sql, args = []) => (await db.execute({ sql, args })).rows[0] || null;
+const all = async (sql, args = []) => (await db.execute({ sql, args })).rows;
+const run = (sql, args = []) => db.execute({ sql, args });
+const randomCode = () => String(Math.floor(1000 + Math.random() * 9000));
+const grade = p => p >= 86 ? 5 : p >= 71 ? 4 : p >= 55 ? 3 : 2;
+const broadcast = (type, payload = {}) => {
+  const msg = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(msg); } catch { sseClients.delete(res); }
+  }
+};
 
-function sign(payload){ return jwt.sign(payload,JWT_SECRET,{expiresIn:'12h'}); }
-async function auth(req,res,next){
-  const h=req.headers.authorization||''; const t=h.startsWith('Bearer ')?h.slice(7):null;
-  if(!t) return res.status(401).json({error:'LOGIN_REQUIRED'});
-  try{
-    const u=jwt.verify(t,JWT_SECRET);
-    if(u.role==='teacher'){
-      const tr=await one('SELECT id,is_active,first_name,last_name,subject FROM teachers WHERE id=?',[u.teacherId]);
-      if(!tr||!Number(tr.is_active)) return res.status(403).json({error:'TEACHER_DISABLED',message:'Siz saytdan foydalana olmaysiz. Admin ga murojaat qiling.'});
-      u.name=`${tr.first_name} ${tr.last_name}`; u.subject=String(tr.subject);
+function sign(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' }); }
+async function auth(req, res, next) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'LOGIN_REQUIRED' });
+  try {
+    const u = jwt.verify(token, JWT_SECRET);
+    if (u.role === 'teacher') {
+      const tr = await one('SELECT id,is_active,first_name,last_name,subject FROM teachers WHERE id=?', [u.teacherId]);
+      if (!tr || !Number(tr.is_active)) {
+        return res.status(403).json({ error: 'TEACHER_DISABLED', message: 'Siz saytdan foydalana olmaysiz. Admin ga murojaat qiling.' });
+      }
+      u.name = `${tr.first_name} ${tr.last_name}`;
+      u.subject = String(tr.subject);
     }
-    req.user=u; next();
-  }catch{ return res.status(401).json({error:'TOKEN_INVALID'}); }
+    req.user = u;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'TOKEN_INVALID' });
+  }
 }
-const adminOnly=(req,res,next)=>req.user?.role==='admin'?next():res.status(403).json({error:'ADMIN_ONLY'});
-const staffOnly=(req,res,next)=>['admin','teacher'].includes(req.user?.role)?next():res.status(403).json({error:'STAFF_ONLY'});
+const adminOnly = (req, res, next) => req.user?.role === 'admin' ? next() : res.status(403).json({ error: 'ADMIN_ONLY' });
+const staffOnly = (req, res, next) => ['admin', 'teacher'].includes(req.user?.role) ? next() : res.status(403).json({ error: 'STAFF_ONLY' });
 
-app.get('/',(req,res)=>res.json({name:'49-Maktab Smart Test API',status:'ok'}));
-app.get('/api/health',async(req,res)=>{ try{await one('SELECT 1 AS ok'); res.json({ok:true,database:'connected'});}catch(e){res.status(503).json({ok:false,message:e.message});} });
-app.get('/api/events',(req,res)=>{ res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.flushHeaders?.();res.write(`event: connected\ndata: {"ok":true}\n\n`);sseClients.add(res);const ping=setInterval(()=>{try{res.write(': ping\n\n')}catch{}},25000);req.on('close',()=>{clearInterval(ping);sseClients.delete(res);}); });
+app.get('/', (req, res) => res.json({ name: '49-Maktab Smart Test API', status: 'ok' }));
+app.get('/api/health', async (req, res) => {
+  try { await one('SELECT 1 AS ok'); res.json({ ok: true, database: 'connected' }); }
+  catch (e) { res.status(503).json({ ok: false, message: e.message }); }
+});
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  res.write(`event: connected\ndata: {"ok":true}\n\n`);
+  sseClients.add(res);
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(ping); sseClients.delete(res); });
+});
 
-app.post('/api/auth/admin',(req,res)=>{ if(String(req.body?.password||'')!==String(process.env.ADMIN_PASSWORD||'')) return res.status(401).json({error:'LOGIN_INVALID'}); res.json({token:sign({role:'admin',name:'Administrator'}),user:{role:'admin',name:'Administrator'}}); });
-app.post('/api/auth/teacher',async(req,res)=>{ const tr=await one('SELECT * FROM teachers WHERE login=?',[clean(req.body?.login,80)]); if(!tr||!(await bcrypt.compare(String(req.body?.password||''),String(tr.password_hash)))) return res.status(401).json({error:'LOGIN_INVALID'}); if(!Number(tr.is_active)) return res.status(403).json({error:'TEACHER_DISABLED',message:'Siz saytdan foydalana olmaysiz. Admin ga murojaat qiling.'}); const name=`${tr.first_name} ${tr.last_name}`; res.json({token:sign({role:'teacher',teacherId:Number(tr.id),name,subject:String(tr.subject)}),user:{role:'teacher',id:Number(tr.id),name,subject:String(tr.subject)}}); });
+app.post('/api/auth/admin', (req, res) => {
+  if (String(req.body?.password || '') !== String(process.env.ADMIN_PASSWORD || '')) return res.status(401).json({ error: 'LOGIN_INVALID' });
+  res.json({ token: sign({ role: 'admin', name: 'Administrator' }), user: { role: 'admin', name: 'Administrator' } });
+});
+app.post('/api/auth/teacher', async (req, res) => {
+  const tr = await one('SELECT * FROM teachers WHERE login=?', [clean(req.body?.login, 80)]);
+  if (!tr || !(await bcrypt.compare(String(req.body?.password || ''), String(tr.password_hash)))) return res.status(401).json({ error: 'LOGIN_INVALID' });
+  if (!Number(tr.is_active)) return res.status(403).json({ error: 'TEACHER_DISABLED', message: 'Siz saytdan foydalana olmaysiz. Admin ga murojaat qiling.' });
+  const name = `${tr.first_name} ${tr.last_name}`;
+  res.json({ token: sign({ role: 'teacher', teacherId: Number(tr.id), name, subject: String(tr.subject) }), user: { role: 'teacher', id: Number(tr.id), name, subject: String(tr.subject) } });
+});
 
-app.get('/api/teachers',auth,adminOnly,async(req,res)=>res.json(await all('SELECT id,first_name,last_name,subject,login,is_active,created_at FROM teachers ORDER BY id DESC')));
-app.post('/api/teachers',auth,adminOnly,async(req,res)=>{ try{const first=clean(req.body?.firstName,80),last=clean(req.body?.lastName,80),subject=clean(req.body?.subject,100),login=clean(req.body?.login,80),password=String(req.body?.password||''); if(!first||!last||!subject||!login||password.length<4)return res.status(400).json({error:'FIELDS_REQUIRED'});const hash=await bcrypt.hash(password,12);const r=await run('INSERT INTO teachers(first_name,last_name,subject,login,password_hash) VALUES(?,?,?,?,?)',[first,last,subject,login,hash]);broadcast('teachers_changed');res.status(201).json({ok:true,id:Number(r.lastInsertRowid)});}catch(e){res.status(409).json({error:'LOGIN_EXISTS',message:e.message});} });
-app.patch('/api/teachers/:id/status',auth,adminOnly,async(req,res)=>{await run('UPDATE teachers SET is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',[req.body?.active?1:0,Number(req.params.id)]);broadcast('teachers_changed');res.json({ok:true});});
-app.patch('/api/teachers/:id',auth,adminOnly,async(req,res)=>{const id=Number(req.params.id);const cur=await one('SELECT * FROM teachers WHERE id=?',[id]);if(!cur)return res.status(404).json({error:'NOT_FOUND'});let hash=String(cur.password_hash);if(req.body?.password)hash=await bcrypt.hash(String(req.body.password),12);await run('UPDATE teachers SET first_name=?,last_name=?,subject=?,login=?,password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',[clean(req.body?.firstName??cur.first_name,80),clean(req.body?.lastName??cur.last_name,80),clean(req.body?.subject??cur.subject,100),clean(req.body?.login??cur.login,80),hash,id]);broadcast('teachers_changed');res.json({ok:true});});
-app.delete('/api/teachers/:id',auth,adminOnly,async(req,res)=>{await run('DELETE FROM teachers WHERE id=?',[Number(req.params.id)]);broadcast('teachers_changed');res.json({ok:true});});
+app.get('/api/teachers', auth, adminOnly, async (req, res) => {
+  res.json(await all('SELECT id,first_name,last_name,subject,login,is_active,created_at FROM teachers ORDER BY id DESC'));
+});
+app.post('/api/teachers', auth, adminOnly, async (req, res) => {
+  try {
+    const first = clean(req.body?.firstName, 80), last = clean(req.body?.lastName, 80), subject = clean(req.body?.subject, 100), login = clean(req.body?.login, 80), password = String(req.body?.password || '');
+    if (!first || !last || !subject || !login || password.length < 4) return res.status(400).json({ error: 'FIELDS_REQUIRED' });
+    const hash = await bcrypt.hash(password, 12);
+    const r = await run('INSERT INTO teachers(first_name,last_name,subject,login,password_hash) VALUES(?,?,?,?,?)', [first, last, subject, login, hash]);
+    broadcast('teachers_changed');
+    res.status(201).json({ ok: true, id: Number(r.lastInsertRowid) });
+  } catch (e) { res.status(409).json({ error: 'LOGIN_EXISTS', message: e.message }); }
+});
+app.patch('/api/teachers/:id/status', auth, adminOnly, async (req, res) => {
+  await run('UPDATE teachers SET is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', [req.body?.active ? 1 : 0, Number(req.params.id)]);
+  broadcast('teachers_changed'); res.json({ ok: true });
+});
+app.patch('/api/teachers/:id', auth, adminOnly, async (req, res) => {
+  const id = Number(req.params.id), cur = await one('SELECT * FROM teachers WHERE id=?', [id]);
+  if (!cur) return res.status(404).json({ error: 'NOT_FOUND' });
+  let hash = String(cur.password_hash);
+  if (req.body?.password) hash = await bcrypt.hash(String(req.body.password), 12);
+  await run('UPDATE teachers SET first_name=?,last_name=?,subject=?,login=?,password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', [
+    clean(req.body?.firstName ?? cur.first_name, 80), clean(req.body?.lastName ?? cur.last_name, 80), clean(req.body?.subject ?? cur.subject, 100), clean(req.body?.login ?? cur.login, 80), hash, id,
+  ]);
+  broadcast('teachers_changed'); res.json({ ok: true });
+});
+app.delete('/api/teachers/:id', auth, adminOnly, async (req, res) => {
+  await run('DELETE FROM teachers WHERE id=?', [Number(req.params.id)]);
+  broadcast('teachers_changed'); res.json({ ok: true });
+});
 
-app.get('/api/tests',auth,staffOnly,async(req,res)=>{ const rows=req.user.role==='admin'?await all('SELECT id,code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,created_at FROM tests ORDER BY id DESC'):await all("SELECT id,code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,created_at FROM tests WHERE owner_type='teacher' AND owner_id=? ORDER BY id DESC",[req.user.teacherId]); res.json(rows); });
-app.post('/api/tests',auth,staffOnly,async(req,res)=>{ const qs=Array.isArray(req.body?.questions)?req.body.questions:[]; if(!qs.length)return res.status(400).json({error:'QUESTIONS_REQUIRED'});const cleaned=qs.map((q,i)=>{const c=String(q.correct||'').toUpperCase();if(!q.question||!q.options?.A||!q.options?.B||!q.options?.C||!['A','B','C'].includes(c))throw new Error(`Savol ${i+1} noto'g'ri`);return{question:clean(q.question,1000),options:{A:clean(q.options.A,500),B:clean(q.options.B,500),C:clean(q.options.C,500)},correct:c};});let testCode=code(req.body?.code)||randomCode();const ownerType=req.user.role==='admin'?'admin':'teacher',ownerId=req.user.role==='teacher'?req.user.teacherId:null;const r=await run('INSERT INTO tests(code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,questions_json) VALUES(?,?,?,?,?,?,?,?,?)',[testCode,clean(req.body?.title,180),clean(req.body?.subject||req.user.subject,100),clean(req.body?.className,30),clean(req.body?.difficulty||'O‘rtacha',40),ownerType,ownerId,req.user.name,JSON.stringify(cleaned)]);broadcast('tests_changed');res.status(201).json({ok:true,id:Number(r.lastInsertRowid),code:testCode}); });
-app.delete('/api/tests/:id',auth,staffOnly,async(req,res)=>{const t=await one('SELECT * FROM tests WHERE id=?',[Number(req.params.id)]);if(!t)return res.status(404).json({error:'NOT_FOUND'});if(req.user.role==='teacher'&&!(t.owner_type==='teacher'&&Number(t.owner_id)===Number(req.user.teacherId)))return res.status(403).json({error:'FORBIDDEN'});await run('DELETE FROM tests WHERE id=?',[Number(req.params.id)]);broadcast('tests_changed');res.json({ok:true});});
+app.get('/api/tests', auth, staffOnly, async (req, res) => {
+  const rows = req.user.role === 'admin'
+    ? await all('SELECT id,code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,created_at FROM tests ORDER BY id DESC')
+    : await all("SELECT id,code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,created_at FROM tests WHERE owner_type='teacher' AND owner_id=? ORDER BY id DESC", [req.user.teacherId]);
+  res.json(rows);
+});
+app.post('/api/tests', auth, staffOnly, async (req, res) => {
+  try {
+    const qs = Array.isArray(req.body?.questions) ? req.body.questions : [];
+    if (!qs.length) return res.status(400).json({ error: 'QUESTIONS_REQUIRED' });
+    const cleaned = qs.map((q, i) => {
+      const c = String(q.correct || '').toUpperCase();
+      if (!q.question || !q.options?.A || !q.options?.B || !q.options?.C || !['A', 'B', 'C'].includes(c)) throw new Error(`Savol ${i + 1} noto'g'ri`);
+      return { question: clean(q.question, 1000), options: { A: clean(q.options.A, 500), B: clean(q.options.B, 500), C: clean(q.options.C, 500) }, correct: c, explanation: clean(q.explanation, 500) };
+    });
+    let testCode = cleanCode(req.body?.code) || randomCode();
+    if (await one('SELECT id FROM tests WHERE code=?', [testCode])) return res.status(409).json({ error: 'CODE_EXISTS', message: 'Bu test kodi band.' });
+    const ownerType = req.user.role === 'admin' ? 'admin' : 'teacher', ownerId = req.user.role === 'teacher' ? req.user.teacherId : null;
+    const r = await run('INSERT INTO tests(code,title,subject,class_name,difficulty,owner_type,owner_id,owner_name,questions_json) VALUES(?,?,?,?,?,?,?,?,?)', [
+      testCode, clean(req.body?.title, 180), clean(req.body?.subject || req.user.subject, 100), clean(req.body?.className, 30), clean(req.body?.difficulty || 'O‘rtacha', 40), ownerType, ownerId, req.user.name, JSON.stringify(cleaned),
+    ]);
+    broadcast('tests_changed'); res.status(201).json({ ok: true, id: Number(r.lastInsertRowid), code: testCode });
+  } catch (e) { res.status(400).json({ error: 'TEST_INVALID', message: e.message }); }
+});
+app.delete('/api/tests/:id', auth, staffOnly, async (req, res) => {
+  const t = await one('SELECT * FROM tests WHERE id=?', [Number(req.params.id)]);
+  if (!t) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (req.user.role === 'teacher' && !(t.owner_type === 'teacher' && Number(t.owner_id) === Number(req.user.teacherId))) return res.status(403).json({ error: 'FORBIDDEN' });
+  await run('DELETE FROM tests WHERE id=?', [Number(req.params.id)]);
+  broadcast('tests_changed'); broadcast('results_changed'); broadcast('access_changed'); res.json({ ok: true });
+});
 
-app.post('/api/public/access/request',async(req,res)=>{const testCode=code(req.body?.code),test=await one('SELECT * FROM tests WHERE code=?',[testCode]);if(!test)return res.status(404).json({error:'TEST_NOT_FOUND'});const r=await run('INSERT INTO access_requests(test_id,test_code,student_first_name,student_last_name,class_name) VALUES(?,?,?,?,?)',[test.id,testCode,clean(req.body?.firstName,80),clean(req.body?.lastName,80),clean(req.body?.className,30)]);broadcast('access_changed');res.status(201).json({ok:true,requestId:Number(r.lastInsertRowid),status:'pending'});});
-app.get('/api/public/access/:id',async(req,res)=>{const r=await one('SELECT status FROM access_requests WHERE id=?',[Number(req.params.id)]);if(!r)return res.status(404).json({error:'NOT_FOUND'});res.json({status:String(r.status)});});
-app.get('/api/access',auth,staffOnly,async(req,res)=>{let rows;if(req.user.role==='admin')rows=await all("SELECT a.*,t.title,t.subject,t.owner_type,t.owner_id,t.owner_name FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE t.owner_type='admin' ORDER BY a.id DESC");else rows=await all("SELECT a.*,t.title,t.subject,t.owner_type,t.owner_id,t.owner_name FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE t.owner_type='teacher' AND t.owner_id=? ORDER BY a.id DESC",[req.user.teacherId]);res.json(rows);});
-app.patch('/api/access/:id',auth,staffOnly,async(req,res)=>{const a=await one('SELECT a.*,t.owner_type,t.owner_id FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?',[Number(req.params.id)]);if(!a)return res.status(404).json({error:'NOT_FOUND'});if(req.user.role==='teacher'&&!(a.owner_type==='teacher'&&Number(a.owner_id)===Number(req.user.teacherId)))return res.status(403).json({error:'FORBIDDEN'});const status=String(req.body?.status||'');if(!['approved','rejected','retry'].includes(status))return res.status(400).json({error:'BAD_STATUS'});await run('UPDATE access_requests SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',[status,Number(req.params.id)]);broadcast('access_changed');res.json({ok:true});});
-app.post('/api/public/access/:id/start',async(req,res)=>{const a=await one('SELECT a.*,t.* FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?',[Number(req.params.id)]);if(!a||String(a.status)!=='approved')return res.status(403).json({error:'NOT_APPROVED'});await run("UPDATE access_requests SET status='started',updated_at=CURRENT_TIMESTAMP WHERE id=?",[Number(req.params.id)]);const qs=JSON.parse(String(a.questions_json));res.json({test:{id:Number(a.test_id),code:String(a.test_code),title:String(a.title),subject:String(a.subject),className:String(a.class_name),ownerName:String(a.owner_name),questions:qs.map((q,index)=>({index,question:q.question,options:q.options}))}});});
-app.post('/api/public/access/:id/submit',async(req,res)=>{const a=await one('SELECT a.*,t.questions_json,t.id AS tid,t.code AS tcode FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?',[Number(req.params.id)]);if(!a||String(a.status)!=='started')return res.status(403).json({error:'NOT_STARTED'});const qs=JSON.parse(String(a.questions_json)),answers=req.body?.answers||{};let correct=0;qs.forEach((q,i)=>{if(String(answers[i]||'').toUpperCase()===String(q.correct).toUpperCase())correct++;});const total=qs.length,wrong=total-correct,pct=Math.round(total?correct*100/total:0);await run('INSERT INTO results(test_id,test_code,student_first_name,student_last_name,class_name,answers_json,question_count,correct_count,wrong_count,percentage,grade) VALUES(?,?,?,?,?,?,?,?,?,?,?)',[a.tid,a.tcode,a.student_first_name,a.student_last_name,a.class_name,JSON.stringify(answers),total,correct,wrong,pct,grade(pct)]);await run("UPDATE access_requests SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE id=?",[Number(req.params.id)]);broadcast('results_changed');broadcast('access_changed');res.json({ok:true,message:'Testni ishlab tugatdingiz. Natijani ustozingizdan olasiz.'});});
+app.post('/api/public/access/request', async (req, res) => {
+  const testCode = cleanCode(req.body?.code), test = await one('SELECT id,code,title,subject FROM tests WHERE code=?', [testCode]);
+  if (!test) return res.status(404).json({ error: 'TEST_NOT_FOUND' });
+  const first = clean(req.body?.firstName, 80), last = clean(req.body?.lastName, 80), className = clean(req.body?.className, 30);
+  if (!first || !last || !className) return res.status(400).json({ error: 'FIELDS_REQUIRED' });
+  const r = await run('INSERT INTO access_requests(test_id,test_code,student_first_name,student_last_name,class_name) VALUES(?,?,?,?,?)', [test.id, testCode, first, last, className]);
+  broadcast('access_changed');
+  res.status(201).json({ ok: true, requestId: Number(r.lastInsertRowid), status: 'pending', test: { code: String(test.code), title: String(test.title), subject: String(test.subject) } });
+});
+app.get('/api/public/access/:id', async (req, res) => {
+  const r = await one('SELECT status,test_code FROM access_requests WHERE id=?', [Number(req.params.id)]);
+  if (!r) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.json({ status: String(r.status), code: String(r.test_code) });
+});
+app.get('/api/access', auth, staffOnly, async (req, res) => {
+  const code = cleanCode(req.query.code || '');
+  const extra = code ? ' AND a.test_code=?' : '';
+  const args = [];
+  let sql;
+  if (req.user.role === 'admin') {
+    sql = `SELECT a.*,t.title,t.subject,t.class_name AS test_class_name,t.owner_type,t.owner_id,t.owner_name FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE t.owner_type='admin'${extra} ORDER BY a.id DESC`;
+    if (code) args.push(code);
+  } else {
+    sql = `SELECT a.*,t.title,t.subject,t.class_name AS test_class_name,t.owner_type,t.owner_id,t.owner_name FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE t.owner_type='teacher' AND t.owner_id=?${extra} ORDER BY a.id DESC`;
+    args.push(req.user.teacherId); if (code) args.push(code);
+  }
+  res.json(await all(sql, args));
+});
+app.patch('/api/access/:id', auth, staffOnly, async (req, res) => {
+  const a = await one('SELECT a.*,t.owner_type,t.owner_id FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?', [Number(req.params.id)]);
+  if (!a) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (req.user.role === 'teacher' && !(a.owner_type === 'teacher' && Number(a.owner_id) === Number(req.user.teacherId))) return res.status(403).json({ error: 'FORBIDDEN' });
+  const status = String(req.body?.status || '');
+  if (!['approved', 'rejected', 'retry'].includes(status)) return res.status(400).json({ error: 'BAD_STATUS' });
+  await run('UPDATE access_requests SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?', [status, Number(req.params.id)]);
+  broadcast('access_changed'); res.json({ ok: true });
+});
+app.post('/api/public/access/:id/start', async (req, res) => {
+  const a = await one('SELECT a.*,t.* FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?', [Number(req.params.id)]);
+  if (!a || !['approved', 'retry'].includes(String(a.status))) return res.status(403).json({ error: 'NOT_APPROVED' });
+  await run("UPDATE access_requests SET status='started',updated_at=CURRENT_TIMESTAMP WHERE id=?", [Number(req.params.id)]);
+  const qs = JSON.parse(String(a.questions_json));
+  res.json({ test: { id: Number(a.test_id), code: String(a.test_code), title: String(a.title), subject: String(a.subject), className: String(a.class_name), ownerName: String(a.owner_name), questions: qs.map((q, index) => ({ index, question: q.question, options: q.options })) } });
+});
+app.post('/api/public/access/:id/submit', async (req, res) => {
+  const a = await one('SELECT a.*,t.questions_json,t.id AS tid,t.code AS tcode FROM access_requests a JOIN tests t ON t.id=a.test_id WHERE a.id=?', [Number(req.params.id)]);
+  if (!a || String(a.status) !== 'started') return res.status(403).json({ error: 'NOT_STARTED' });
+  const qs = JSON.parse(String(a.questions_json)), answers = req.body?.answers || {};
+  let correct = 0;
+  qs.forEach((q, i) => { if (String(answers[i] ?? '').toUpperCase() === String(q.correct).toUpperCase()) correct++; });
+  const total = qs.length, wrong = total - correct, pct = Math.round(total ? correct * 100 / total : 0);
+  await run('INSERT INTO results(test_id,test_code,student_first_name,student_last_name,class_name,answers_json,question_count,correct_count,wrong_count,percentage,grade) VALUES(?,?,?,?,?,?,?,?,?,?,?)', [
+    a.tid, a.tcode, a.student_first_name, a.student_last_name, a.class_name, JSON.stringify(answers), total, correct, wrong, pct, grade(pct),
+  ]);
+  await run("UPDATE access_requests SET status='completed',updated_at=CURRENT_TIMESTAMP WHERE id=?", [Number(req.params.id)]);
+  broadcast('results_changed'); broadcast('access_changed');
+  res.json({ ok: true, message: 'Testni ishlab tugatdingiz. Natijani ustozingizdan olasiz.' });
+});
 
-app.get('/api/results',auth,staffOnly,async(req,res)=>{const testCode=code(req.query.code);if(!testCode)return res.status(400).json({error:'CODE_REQUIRED'});const t=await one('SELECT * FROM tests WHERE code=?',[testCode]);if(!t)return res.status(404).json({error:'TEST_NOT_FOUND'});if(req.user.role==='teacher'&&!(t.owner_type==='teacher'&&Number(t.owner_id)===Number(req.user.teacherId)))return res.status(403).json({error:'FORBIDDEN'});res.json({test:{code:t.code,title:t.title,subject:t.subject,ownerName:t.owner_name},results:await all('SELECT * FROM results WHERE test_code=? ORDER BY id DESC',[testCode])});});
-app.delete('/api/results/:id',auth,staffOnly,async(req,res)=>{const r=await one('SELECT r.*,t.owner_type,t.owner_id FROM results r JOIN tests t ON t.id=r.test_id WHERE r.id=?',[Number(req.params.id)]);if(!r)return res.status(404).json({error:'NOT_FOUND'});if(req.user.role==='teacher'&&!(r.owner_type==='teacher'&&Number(r.owner_id)===Number(req.user.teacherId)))return res.status(403).json({error:'FORBIDDEN'});await run('DELETE FROM results WHERE id=?',[Number(req.params.id)]);broadcast('results_changed');res.json({ok:true});});
+app.get('/api/results', auth, staffOnly, async (req, res) => {
+  const testCode = cleanCode(req.query.code);
+  if (!testCode) return res.status(400).json({ error: 'CODE_REQUIRED' });
+  const t = await one('SELECT * FROM tests WHERE code=?', [testCode]);
+  if (!t) return res.status(404).json({ error: 'TEST_NOT_FOUND' });
+  if (req.user.role === 'teacher' && !(t.owner_type === 'teacher' && Number(t.owner_id) === Number(req.user.teacherId))) return res.status(403).json({ error: 'FORBIDDEN' });
+  const questions = JSON.parse(String(t.questions_json || '[]'));
+  res.json({
+    test: { code: t.code, id: Number(t.id), title: t.title, subject: t.subject, className: t.class_name, difficulty: t.difficulty, ownerType: t.owner_type, ownerId: t.owner_id, ownerName: t.owner_name, questions },
+    results: await all('SELECT * FROM results WHERE test_code=? ORDER BY id DESC', [testCode]),
+  });
+});
+app.delete('/api/results/:id', auth, staffOnly, async (req, res) => {
+  const r = await one('SELECT r.*,t.owner_type,t.owner_id FROM results r JOIN tests t ON t.id=r.test_id WHERE r.id=?', [Number(req.params.id)]);
+  if (!r) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (req.user.role === 'teacher' && !(r.owner_type === 'teacher' && Number(r.owner_id) === Number(req.user.teacherId))) return res.status(403).json({ error: 'FORBIDDEN' });
+  await run('DELETE FROM results WHERE id=?', [Number(req.params.id)]);
+  broadcast('results_changed'); res.json({ ok: true });
+});
+app.delete('/api/results', auth, staffOnly, async (req, res) => {
+  const testCode = cleanCode(req.query.code);
+  if (!testCode) return res.status(400).json({ error: 'CODE_REQUIRED' });
+  const t = await one('SELECT * FROM tests WHERE code=?', [testCode]);
+  if (!t) return res.status(404).json({ error: 'TEST_NOT_FOUND' });
+  if (req.user.role === 'teacher' && !(t.owner_type === 'teacher' && Number(t.owner_id) === Number(req.user.teacherId))) return res.status(403).json({ error: 'FORBIDDEN' });
+  await run('DELETE FROM results WHERE test_code=?', [testCode]);
+  broadcast('results_changed'); res.json({ ok: true });
+});
 
-function encKey(text){const raw=process.env.SETTINGS_ENCRYPTION_KEY||'';if(!raw)throw new Error('SETTINGS_ENCRYPTION_KEY missing');const key=crypto.createHash('sha256').update(raw).digest(),iv=crypto.randomBytes(12),c=crypto.createCipheriv('aes-256-gcm',key,iv),data=Buffer.concat([c.update(text,'utf8'),c.final()]),tag=c.getAuthTag();return [iv.toString('base64'),tag.toString('base64'),data.toString('base64')].join('.');}
-function decKey(payload){const raw=process.env.SETTINGS_ENCRYPTION_KEY||'',key=crypto.createHash('sha256').update(raw).digest(),[a,b,c]=String(payload||'').split('.'),d=crypto.createDecipheriv('aes-256-gcm',key,Buffer.from(a,'base64'));d.setAuthTag(Buffer.from(b,'base64'));return Buffer.concat([d.update(Buffer.from(c,'base64')),d.final()]).toString('utf8');}
-app.put('/api/admin/settings/gemini',auth,adminOnly,async(req,res)=>{const apiKey=String(req.body?.apiKey||'').trim(),model=clean(req.body?.model||'gemini-3.5-flash-lite',80);if(!apiKey)return res.status(400).json({error:'KEY_REQUIRED'});await run("INSERT INTO settings(key,value) VALUES('gemini_api_key',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP",[encKey(apiKey)]);await run("INSERT INTO settings(key,value) VALUES('gemini_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP",[model]);res.json({ok:true});});
-app.get('/api/admin/settings/gemini',auth,adminOnly,async(req,res)=>{const k=await one("SELECT value FROM settings WHERE key='gemini_api_key'"),m=await one("SELECT value FROM settings WHERE key='gemini_model'");res.json({configured:!!k,model:m?.value||'gemini-3.5-flash-lite'});});
-app.post('/api/admin/ai/generate',auth,adminOnly,async(req,res)=>{try{const k=await one("SELECT value FROM settings WHERE key='gemini_api_key'"),m=await one("SELECT value FROM settings WHERE key='gemini_model'");if(!k)return res.status(400).json({error:'GEMINI_KEY_MISSING',message:'Gemini API key o‘rnatilmagan.'});const apiKey=decKey(k.value),model=String(m?.value||'gemini-3.5-flash-lite'),count=Math.min(Math.max(Number(req.body?.count)||10,1),40),prompt=`49-maktab uchun test yarating. Fan: ${clean(req.body?.subject,100)}. Sinf: ${clean(req.body?.className,30)}. Mavzu: ${clean(req.body?.topic,180)}. Savollar soni: ${count}. Daraja: ${clean(req.body?.difficulty||'Oson',40)}. Har savolda faqat A,B,C bo‘lsin, bittasi to‘g‘ri. Sinf yoshiga mos yozing. Noto‘g‘ri variantlar ham mavzuga yaqin va mantiqli bo‘lsin. Faqat JSON: {"questions":[{"question":"...","options":{"A":"...","B":"...","C":"..."},"correct":"A"}]}`;const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':apiKey},body:JSON.stringify({contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json'}}),signal:AbortSignal.timeout(30000)});const data=await response.json().catch(()=>({}));if(!response.ok){if([401,403,429].includes(response.status))return res.status(400).json({error:'GEMINI_KEY_OR_LIMIT_ERROR',message:'API key ishlamayapti yoki so‘rov limiti tugagan. Administrator → Sozlamalar bo‘limidan yangi Gemini API key o‘rnating.'});return res.status(400).json({error:'GEMINI_ERROR',message:data?.error?.message||'Gemini xatosi'});}const text=data?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('')||'{}';res.json(JSON.parse(text));}catch(e){res.status(500).json({error:'AI_ERROR',message:e.message});}});
+function encKey(text) {
+  const raw = process.env.SETTINGS_ENCRYPTION_KEY || '';
+  if (!raw) throw new Error('SETTINGS_ENCRYPTION_KEY missing');
+  const key = crypto.createHash('sha256').update(raw).digest(), iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([c.update(text, 'utf8'), c.final()]), tag = c.getAuthTag();
+  return [iv.toString('base64'), tag.toString('base64'), data.toString('base64')].join('.');
+}
+function decKey(payload) {
+  const raw = process.env.SETTINGS_ENCRYPTION_KEY || '', key = crypto.createHash('sha256').update(raw).digest();
+  const [a, b, c] = String(payload || '').split('.'), d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(a, 'base64'));
+  d.setAuthTag(Buffer.from(b, 'base64'));
+  return Buffer.concat([d.update(Buffer.from(c, 'base64')), d.final()]).toString('utf8');
+}
+app.put('/api/admin/settings/gemini', auth, adminOnly, async (req, res) => {
+  const apiKey = String(req.body?.apiKey || '').trim(), model = clean(req.body?.model || 'gemini-3.5-flash-lite', 80);
+  if (!apiKey) return res.status(400).json({ error: 'KEY_REQUIRED' });
+  await run("INSERT INTO settings(key,value) VALUES('gemini_api_key',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP", [encKey(apiKey)]);
+  await run("INSERT INTO settings(key,value) VALUES('gemini_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP", [model]);
+  res.json({ ok: true });
+});
+app.get('/api/admin/settings/gemini', auth, adminOnly, async (req, res) => {
+  const k = await one("SELECT value FROM settings WHERE key='gemini_api_key'"), m = await one("SELECT value FROM settings WHERE key='gemini_model'");
+  res.json({ configured: !!k, model: m?.value || 'gemini-3.5-flash-lite' });
+});
+app.post('/api/admin/ai/generate', auth, adminOnly, async (req, res) => {
+  try {
+    const k = await one("SELECT value FROM settings WHERE key='gemini_api_key'"), m = await one("SELECT value FROM settings WHERE key='gemini_model'");
+    if (!k) return res.status(400).json({ error: 'GEMINI_KEY_MISSING', message: 'Gemini API key o‘rnatilmagan.' });
+    const apiKey = decKey(k.value), model = String(m?.value || 'gemini-3.5-flash-lite'), count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 40);
+    const difficulty = clean(req.body?.difficulty || 'Oson', 40), className = clean(req.body?.className, 30);
+    const prompt = `49-maktab uchun sifatli test yarating. Fan: ${clean(req.body?.subject, 100)}. Sinf: ${className}. Mavzu: ${clean(req.body?.topic, 180)}. Savollar soni: ${count}. Daraja: ${difficulty}. Har savolda faqat A,B,C bo‘lsin, bittasi to‘g‘ri. ${difficulty === 'Oson' ? `${className} o‘quvchisiga sodda va yoshiga mos yozing; oson testni sun'iy qiyinlashtirmang.` : ''} Noto‘g‘ri variantlar ham mavzuga yaqin, ishonarli, grammatik jihatdan mos bo‘lsin; tasodifiy yoki kulgili variant bermang. Faqat JSON: {"questions":[{"question":"...","options":{"A":"...","B":"...","C":"..."},"correct":"A","explanation":"..."}]}`;
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json' } }), signal: AbortSignal.timeout(30000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if ([401, 403, 429].includes(response.status)) return res.status(400).json({ error: 'GEMINI_KEY_OR_LIMIT_ERROR', message: 'API key ishlamayapti yoki so‘rov limiti tugagan. Administrator → Sozlamalar bo‘limidan yangi Gemini API key o‘rnating.' });
+      return res.status(400).json({ error: 'GEMINI_ERROR', message: data?.error?.message || 'Gemini xatosi' });
+    }
+    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '{}';
+    res.json(JSON.parse(text));
+  } catch (e) { res.status(500).json({ error: 'AI_ERROR', message: e.message }); }
+});
 
-app.use((err,req,res,next)=>{console.error(err);res.status(err.status||500).json({error:'SERVER_ERROR',message:err.message||'Server xatosi'});});
-app.listen(PORT,'0.0.0.0',()=>console.log(`49-Maktab API running on ${PORT}`));
+app.use((err, req, res, next) => { console.error(err); res.status(err.status || 500).json({ error: 'SERVER_ERROR', message: err.message || 'Server xatosi' }); });
+app.listen(PORT, '0.0.0.0', () => console.log(`49-Maktab API running on ${PORT}`));
