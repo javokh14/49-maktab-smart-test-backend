@@ -14,10 +14,10 @@ services:
       - key: TURSO_AUTH_TOKEN
         sync: false
       - key: JWT_SECRET
-        sync: false
+        generateValue: true
       - key: ADMIN_PASSWORD
         sync: false
       - key: SETTINGS_ENCRYPTION_KEY
-        sync: false
+        generateValue: true
       - key: ALLOWED_ORIGINS
         sync: false
